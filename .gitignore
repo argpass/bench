@@ -1,0 +1,11 @@
+qjcg_admin/
+conf/
+conf
+qjcg_admin/
+.local
+*.pyc
+tags
+.idea
+*.bak
+*.log*
+.vscode

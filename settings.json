@@ -1,0 +1,12 @@
+{
+  "INSTALLED_APPS": ["apps.bench_mysql"],
+  "BENCH_MYSQL": {
+    "mysql": {
+	    "host": "localhost",
+	    "port": 3306,
+	    "database": "bench",
+	    "user": "root",
+	    "password": "akun@123"
+    }
+  }
+}

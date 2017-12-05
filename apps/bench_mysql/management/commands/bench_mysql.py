@@ -125,19 +125,19 @@ def add_locations(locations, db, table):
         last_insert_id += 1
 
 
-def run(log_level='INFO', pid_file='/var/run/mysqld/mysqld.pid',
+def run(action, log_level='INFO', pid_file='/var/run/mysqld/mysqld.pid',
         inf_db='mysql_bench'):
     configure(log_level)
     log.set_tracking("RUN")
 
     group = sync.ThreadGroup()
     conf = settings.BENCH_MYSQL
-    logging.warning("config:%s", conf)
+    logging.warning("action:%s, config:%s", action, conf)
     db_conf = conf["mysql"]
     db = new(**db_conf)
     sql = open(os.path.join(CURRENT_DIR, "./bench_mysql.sql")).read()
     result = db.execute(sql)
-    logging.info("executing sql(result=%s):%s", result, sql)
+    # logging.info("executing sql(result=%s):%s", result, sql)
     client = InfluxDBClient('localhost', 8086, 'root', 'root',
                             database=inf_db)
     client.create_database(inf_db)
@@ -161,17 +161,18 @@ def run(log_level='INFO', pid_file='/var/run/mysqld/mysqld.pid',
     def fn_send_ibeat(ibeat, dt):
         sender.send((dt, ibeat))
 
-    # mysql_pid = int(open(pid_file).read())
-    mysql_pid = 1
+    mysql_pid = int(open(pid_file).read())
     try:
-        group.go(
-            sending_locations,
-            (group.stopped, terms, db, fn_send_ibeat), {}
-        )
-        group.go(
-            stat_mysql,
-            (group.stopped, mysql_pid, db, fn_send_ibeat), {}
-        )
+        if action == 'sending':
+            group.go(
+                sending_locations,
+                (group.stopped, 1500000000, 1000, terms, db, fn_send_ibeat), {}
+            )
+        if action == 'stat':
+            group.go(
+                stat_mysql,
+                (group.stopped, mysql_pid, db, fn_send_ibeat), {}
+            )
         group.join()
     except (KeyboardInterrupt, SystemExit) as e:
         logging.warning("canncelling by `%s`", e)
@@ -183,15 +184,14 @@ def run(log_level='INFO', pid_file='/var/run/mysqld/mysqld.pid',
         logging.warning("bye")
 
 
-def sending_locations(cancelled, terms: List[Dict], db: Database, send_ibeat):
+def sending_locations(cancelled, begin_ts: int, batch_size: int, terms: List[Dict], db: Database, send_ibeat):
     log.set_tracking("SEND_LOCS")
-    timestamp_cur = int(time.time())
-    size_per_s = 10000
-    sleep_s = 0.1
+    timestamp_cur = begin_ts
+    last_ibeat = None
     while not cancelled.isSet():
         try:
+            begin = int(time.time() * 1000)
             batch = []
-            batch_size = int(size_per_s / (1/sleep_s))
             for i in [random.randint(0, len(terms) - 1)
                       for _ in range(batch_size)]:
                 term = terms[i]
@@ -208,24 +208,29 @@ def sending_locations(cancelled, terms: List[Dict], db: Database, send_ibeat):
                     "locate_error": 1000,
                     "snr": 10,
                     "degree": 50,
-                    "timestamp": timestamp_cur,
+                    "gps_timestamp": timestamp_cur,
                 }
                 batch.append(location)
+                if batch_size % 800 == 0:
+                    timestamp_cur += 1
             timestamp_cur += 1
-            begin = time.time()
+            build_cost = int(time.time() * 1000) - begin
+            begin = int(time.time() * 1000)
             add_locations(batch, db, table='t_location')
-            cost = int((time.time() - begin) * 1000)
-            send_ibeat({
+            cost = int(time.time() * 1000) - begin
+            ibeat = {
                 "sending_cnt": batch_size,
-                "sending_cost": cost
-            }, datetime.utcnow())
-            time.sleep(sleep_s)
+                "sending_cost": cost,
+                "build_cost": build_cost,
+            }
+            logging.info("sending batch %s", ibeat)
+            send_ibeat(ibeat, datetime.utcfromtimestamp(timestamp_cur))
         except Exception as e:
             logging.exception(u"err:%s", e.args)
     logging.warning("bye")
 
 
-def stat_mysql(cancelled, pid, db: Database, send_ibeat, interval=2):
+def stat_mysql(cancelled, pid, db: Database, send_ibeat, interval=10):
     """
     周期统计mysql: 进程io信息,Innodb引擎信息
     """
@@ -236,8 +241,11 @@ def stat_mysql(cancelled, pid, db: Database, send_ibeat, interval=2):
             or {"id": 0}
         return last_row["id"]
 
-    last_id = get_last_row_id(db)
+    last_ibeat = None
     next_t = time.time() + interval
+    delta_keys = ("row_delta", "rchar", "wchar", "syscr", "syscw", "read_bytes",
+                  "write_bytes", "Innodb_data_fsyncs", "Innodb_os_log_fsyncs")
+    trace_keys = ("rows",)
     while not cancelled.isSet():
         ts = int(time.time())
         wait_s = next_t - ts
@@ -249,25 +257,27 @@ def stat_mysql(cancelled, pid, db: Database, send_ibeat, interval=2):
 
         # 位置表行增长
         current_row_id = get_last_row_id(db)
-        row_incr = current_row_id - last_id
-        last_id = current_row_id
-
-        ibeat = dict(row_incr=row_incr)
-        ibeat["syscr"] = 0
-        # with open("/proc/{pid}/io".format(pid=pid)) as fi:
-        #     for line in fi.readlines():
-        #         key, value = line.split(':')
-        #         ival = int(value)
-        #         ibeat[key] = ival
+        ibeat = dict(row_delta=current_row_id, rows=current_row_id)
+        # ibeat["syscr"] = 0
+        with open("/proc/{pid}/io".format(pid=pid)) as fi:
+            for line in fi.readlines():
+                key, value = line.split(':')
+                ival = int(value)
+                ibeat[key] = ival
 
         ibeat.update({row["Variable_name"]: int(row["Value"])
                       for row in db.query("show status like '%%sync%%'")})
-        send_ibeat(ibeat, now)
-        cost = time.time() - begin
-        if 2 * cost > interval:
-            logging.warning(u"stat cost %s is too much, interval %s",
-                            cost, interval)
-        logging.info("send ibeat:%s, cost:%s", ibeat, cost)
+        if last_ibeat:
+            ibeat_delta = {k: v - last_ibeat[k] for k, v in ibeat.items() if k in delta_keys}
+            to_send = ibeat_delta.copy()
+            to_send.update({k: v for k, v in ibeat.items() if k in trace_keys})
+            send_ibeat(to_send, now)
+            cost = time.time() - begin
+            if 2 * cost > interval:
+                logging.warning(u"stat cost %s is too much, interval %s",
+                                cost, interval)
+            logging.info("send ibeat_delta:%s, cost:%s", to_send, cost)
+        last_ibeat = {k: v for k, v in ibeat.items() if k in delta_keys}
         next_t = ts + interval
     logging.warning("bye")
 
@@ -292,9 +302,17 @@ class Command(BaseCommand):
             default="INFO",
             help='[DEBUG, INFO,...] logging level'
         )
+        # action
+        parser.add_argument(
+            '--action',
+            '-a',
+            dest='action',
+            default="sending",
+            help='[sending, stat] task action'
+        )
 
     def handle(self, *args, **options):
         show_sql = bool(options["show_sql"])
         log_level = str(options["logging"]).upper()
 
-        run(log_level)
+        run(options["action"], log_level)

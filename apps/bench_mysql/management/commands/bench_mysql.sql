@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS `t_location` (
   PRIMARY KEY (`id`,`timestamp`,`category`),
   KEY `location_tid` (`tid`,`timestamp`,`category`) USING BTREE,
   KEY `loc1` (`car_id`,`timestamp`,`locate_type`,`category`) USING BTREE
-) ENGINE=InnoDB AUTO_INCREMENT=7735677715 DEFAULT CHARSET=utf8 COLLATE=utf8_bin COMMENT='位置信息。'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin COMMENT='位置信息。'
 /*!50100 PARTITION BY RANGE (timestamp)
 (PARTITION p2017_10_1 VALUES LESS THAN (1506787200) ENGINE = InnoDB,
  PARTITION p2017_10_10 VALUES LESS THAN (1507564800) ENGINE = InnoDB,
